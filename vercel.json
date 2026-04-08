@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/spot.ts": {
+      "maxDuration": 30
+    }
+  },
+  "regions": ["fra1"]
+}
