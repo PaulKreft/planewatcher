@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import dns from 'node:dns';
-import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from 'undici';
+import { Agent, ProxyAgent, fetch as undiciFetch } from 'undici';
 import { Redis } from '@upstash/redis';
 
 /** Prefer IPv4 — Vercel ↔ OpenSky often stalls on broken IPv6 paths. */
@@ -10,17 +10,18 @@ const redis = Redis.fromEnv();
 
 /**
  * OpenSky often drops or blackholes datacenter egress (ETIMEDOUT to auth API).
- * Optional HTTP(S) CONNECT proxy that can reach OpenSky (small VPS, home tunnel, etc.):
- * `http://user:pass@host:port` or `http://host:port`
+ * Optional HTTP CONNECT proxy: `http://user:pass@host:port` or `http://host:port`
+ *
+ * Use raw ProxyAgent (not EnvHttpProxyAgent): the latter honors NO_PROXY, so a
+ * Vercel/env NO_PROXY=* or similar would skip the proxy and still hit ETIMEDOUT direct to OpenSky.
  */
 const OPENSKY_PROXY = process.env.OPENSKY_HTTPS_PROXY?.trim();
 
 const openskyConnectOpts = { timeout: 35_000 } as const;
 
 const openskyDispatcher = OPENSKY_PROXY
-  ? new EnvHttpProxyAgent({
-      httpsProxy: OPENSKY_PROXY,
-      httpProxy: OPENSKY_PROXY,
+  ? new ProxyAgent({
+      uri: OPENSKY_PROXY,
       connect: openskyConnectOpts,
     })
   : new Agent({ connect: openskyConnectOpts });
@@ -41,6 +42,17 @@ const OS_TOKEN_URL =
 // for the very first run before the dashboard has been used.
 // ──────────────────────────────────────────────────────────────────
 export type WatchConfig = { lat: number; lon: number; radiusKm: number };
+
+interface NormalizedAircraft {
+  icao24: string;
+  callsign: string;
+  lat: number;
+  lon: number;
+  altM: number | null;
+  velMs: number | null;
+  heading: number | null;
+  knownType: string | null;
+}
 
 export async function getConfig(): Promise<WatchConfig> {
   const stored = await redis.get<WatchConfig>('config');
@@ -120,7 +132,11 @@ async function timedFetch(
   }
 }
 
-function hintForOpenSkyFailure(stage: string, detail: string): string | undefined {
+function hintForOpenSkyFailure(
+  stage: string,
+  detail: string,
+  proxyConfigured: boolean,
+): string | undefined {
   if (!stage.startsWith('opensky.')) return undefined;
   const d = detail.toLowerCase();
   if (
@@ -129,12 +145,30 @@ function hintForOpenSkyFailure(stage: string, detail: string): string | undefine
     d.includes('econnrefused') ||
     d.includes('network unreachable')
   ) {
+    if (proxyConfigured) {
+      return (
+        'OPENSKY_HTTPS_PROXY is set but the connection still failed. ' +
+        'Confirm the proxy URL is reachable from Vercel, speaks HTTP CONNECT, and can forward TLS to opensky-network.org:443. ' +
+        'If the error still names 194.209.200.34, the tunnel target may be timing out (proxy cannot reach OpenSky either).'
+      );
+    }
     return (
       'OpenSky’s auth and data API use the same IP; if Vercel cannot open TCP (ETIMEDOUT), both token and /states fail. ' +
-      'Set OPENSKY_HTTPS_PROXY to an HTTP CONNECT proxy that can reach opensky-network.org, try a different regions value in vercel.json (e.g. iad1), or run the poller on a host with working connectivity.'
+      'Set OPENSKY_HTTPS_PROXY in Vercel (Production) to an HTTP CONNECT proxy that can reach opensky-network.org:443, ' +
+      'or try another regions value in vercel.json, or run the poller off Vercel.'
     );
   }
   return undefined;
+}
+
+function openSkyErrorExtras(stage: string, detail: string) {
+  if (!stage.startsWith('opensky.')) return {};
+  const proxyConfigured = Boolean(OPENSKY_PROXY);
+  const hint = hintForOpenSkyFailure(stage, detail, proxyConfigured);
+  return {
+    openskyProxyConfigured: proxyConfigured,
+    ...(hint ? { hint } : {}),
+  };
 }
 
 function isTimeoutError(e: unknown): boolean {
@@ -284,6 +318,56 @@ async function fetchOpenSky(t: Tracer, token: string, cfg: WatchConfig) {
   return j.states ?? [];
 }
 
+function normalizeOpenSkyStates(states: unknown[][]): NormalizedAircraft[] {
+  return states
+    .filter(s => s[5] != null && s[6] != null)
+    .map(s => ({
+      icao24: s[0] as string,
+      callsign: ((s[1] as string) || '').trim() || (s[0] as string).toUpperCase(),
+      lat: s[6] as number,
+      lon: s[5] as number,
+      altM: (s[7] as number) ?? null,
+      velMs: (s[9] as number) ?? null,
+      heading: (s[10] as number) ?? null,
+      knownType: null,
+    }));
+}
+
+interface AdsbLolAircraft {
+  hex: string;
+  flight?: string;
+  lat: number;
+  lon: number;
+  alt_baro?: number | 'ground';
+  gs?: number;
+  track?: number;
+  t?: string;
+}
+
+async function fetchAdsbLol(
+  t: Tracer,
+  cfg: WatchConfig,
+): Promise<NormalizedAircraft[]> {
+  const distNm = Math.round(cfg.radiusKm * 0.53996);
+  const url = `https://api.adsb.lol/v2/lat/${cfg.lat}/lon/${cfg.lon}/dist/${distNm}`;
+  const r = await t.run('adsb.lol.states', () =>
+    timedFetch('adsb.lol', url, {}, 15_000),
+  );
+  const j = (await r.json()) as { ac?: AdsbLolAircraft[] };
+  return (j.ac ?? [])
+    .filter(a => a.lat != null && a.lon != null)
+    .map(a => ({
+      icao24: a.hex,
+      callsign: a.flight?.trim() || a.hex.toUpperCase(),
+      lat: a.lat,
+      lon: a.lon,
+      altM: typeof a.alt_baro === 'number' ? a.alt_baro * 0.3048 : null,
+      velMs: typeof a.gs === 'number' ? a.gs * 0.5144 : null,
+      heading: a.track ?? null,
+      knownType: a.t ?? null,
+    }));
+}
+
 async function lookupType(icao24: string): Promise<string | null> {
   const key = `type:${icao24}`;
   const cached = await redis.get<string>(key);
@@ -375,70 +459,76 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const cfg = await t.run('redis.get(config)', () => getConfig());
-    const token = await getOpenSkyToken(t);
-    const states = await fetchOpenSky(t, token, cfg);
+
+    let aircraft: NormalizedAircraft[];
+    let source = 'opensky';
+
+    try {
+      const token = await getOpenSkyToken(t);
+      const states = await fetchOpenSky(t, token, cfg);
+      aircraft = normalizeOpenSkyStates(states);
+    } catch {
+      t.steps.push({
+        stage: 'opensky→adsb.lol',
+        ms: 0,
+        ok: true,
+        detail: 'OpenSky unreachable, falling back to adsb.lol',
+      });
+      aircraft = await fetchAdsbLol(t, cfg);
+      source = 'adsb.lol';
+    }
 
     const alerted: string[] = [];
 
-    await t.run(`process(${states.length})`, async () => {
-      for (const s of states) {
-        const icao24 = s[0] as string;
-        const lon = s[5] as number | null;
-        const lat = s[6] as number | null;
-        if (lat == null || lon == null) continue;
-
-        const type = await lookupType(icao24);
+    await t.run(`process(${aircraft.length})`, async () => {
+      for (const ac of aircraft) {
+        const type = ac.knownType ?? (await lookupType(ac.icao24));
         if (!type || !/^A38/i.test(type)) continue;
 
-        const claimed = await redis.set(`seen:${icao24}`, Date.now(), {
+        const claimed = await redis.set(`seen:${ac.icao24}`, Date.now(), {
           ex: ALERT_TTL_SECONDS,
           nx: true,
         });
         if (claimed === null) continue;
 
-        const callsign =
-          ((s[1] as string) || '').trim() || icao24.toUpperCase();
-        const altM = s[7] as number | null;
-        const velMs = s[9] as number | null;
-        const heading = s[10] as number | null;
-        const dist = haversine(cfg.lat, cfg.lon, lat, lon);
-        const altFt = altM ? Math.round(altM * 3.281) : null;
-        const velKts = velMs ? Math.round(velMs * 1.944) : null;
+        const dist = haversine(cfg.lat, cfg.lon, ac.lat, ac.lon);
+        const altFt = ac.altM ? Math.round(ac.altM * 3.281) : null;
+        const velKts = ac.velMs ? Math.round(ac.velMs * 1.944) : null;
 
         await postToSlack(
           t,
-          callsign,
-          icao24,
+          ac.callsign,
+          ac.icao24,
           dist,
           altFt?.toLocaleString() ?? '?',
           velKts ?? '?',
-          heading,
+          ac.heading,
         );
 
-        // Log sighting to Redis history (capped list)
         const sighting = {
           ts: Date.now(),
-          icao24,
-          callsign,
+          icao24: ac.icao24,
+          callsign: ac.callsign,
           type,
           distKm: Number(dist.toFixed(1)),
           altFt,
           velKts,
-          heading,
-          lat,
-          lon,
+          heading: ac.heading,
+          lat: ac.lat,
+          lon: ac.lon,
         };
         await redis.lpush('sightings', JSON.stringify(sighting));
         await redis.ltrim('sightings', 0, SIGHTINGS_MAX - 1);
 
-        alerted.push(callsign);
+        alerted.push(ac.callsign);
       }
     });
 
     return res.status(200).json({
       ok: true,
+      source,
       config: cfg,
-      checked: states.length,
+      checked: aircraft.length,
       alerted,
       totalMs: t.totalMs(),
       steps: t.steps,
@@ -447,15 +537,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const failed = t.steps.find(s => !s.ok);
     const errText =
       failed?.detail ?? (e instanceof Error ? e.message : String(e));
-    const hint =
+    const extras =
       failed?.detail && failed?.stage
-        ? hintForOpenSkyFailure(failed.stage, failed.detail)
-        : undefined;
+        ? openSkyErrorExtras(failed.stage, failed.detail)
+        : {};
     return res.status(500).json({
       ok: false,
       stage: failed?.stage ?? 'unknown',
       error: errText,
-      ...(hint ? { hint } : {}),
+      ...extras,
       totalMs: t.totalMs(),
       steps: t.steps,
     });
