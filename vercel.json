@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/spot.ts": {
-      "maxDuration": 60
+      "maxDuration": 120
     }
   },
   "regions": ["fra1"]

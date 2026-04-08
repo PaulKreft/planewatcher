@@ -1,7 +1,19 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import dns from 'node:dns';
+import { Agent, fetch as undiciFetch } from 'undici';
 import { Redis } from '@upstash/redis';
 
+/** Prefer IPv4 — Vercel ↔ OpenSky often stalls on broken IPv6 paths. */
+dns.setDefaultResultOrder('ipv4first');
+
 const redis = Redis.fromEnv();
+
+/** Undici default connect timeout is 10s; OpenSky auth often needs more from serverless. */
+const openskyDispatcher = new Agent({
+  connect: {
+    timeout: 35_000,
+  },
+});
 
 const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL!;
 const CRON_SECRET = process.env.CRON_SECRET!;
@@ -99,25 +111,64 @@ async function timedFetch(
 }
 
 function isTimeoutError(e: unknown): boolean {
-  return (
-    e instanceof Error &&
-    (e.name === 'AbortError' ||
-      /timed out after \d+ms/.test(e.message))
-  );
+  if (!(e instanceof Error)) return false;
+  if (e.name === 'AbortError' || /timed out after \d+ms/.test(e.message))
+    return true;
+  let cur: unknown = e;
+  for (let d = 0; d < 5 && cur instanceof Error; d++) {
+    if (cur.name === 'ConnectTimeoutError') return true;
+    if (/Connect Timeout Error/i.test(cur.message)) return true;
+    cur = 'cause' in cur ? cur.cause : null;
+  }
+  return false;
 }
 
-/** Retries only on transport timeouts (slow / stalled upstream). */
-async function timedFetchWithRetry(
+type UndiciResponse = Awaited<ReturnType<typeof undiciFetch>>;
+
+async function timedOpenSkyFetch(
+  label: string,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<UndiciResponse> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const reqBody = init.body;
+  try {
+    const r = await undiciFetch(url, {
+      method: init.method,
+      headers: init.headers,
+      ...(reqBody != null ? { body: reqBody } : {}),
+      signal: ctrl.signal,
+      dispatcher: openskyDispatcher,
+    } as Parameters<typeof undiciFetch>[1]);
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      throw new Error(`${label} HTTP ${r.status}: ${body.slice(0, 200)}`);
+    }
+    return r;
+  } catch (e: unknown) {
+    if (e instanceof Error && e.name === 'AbortError') {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Retries only on transport timeouts (slow connect / stalled upstream). */
+async function timedOpenSkyFetchWithRetry(
   label: string,
   url: string,
   init: RequestInit,
   timeoutMs: number,
   attempts: number,
-): Promise<Response> {
+): Promise<UndiciResponse> {
   let last: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await timedFetch(label, url, init, timeoutMs);
+      return await timedOpenSkyFetch(label, url, init, timeoutMs);
     } catch (e) {
       last = e;
       if (!isTimeoutError(e) || i === attempts - 1) throw e;
@@ -165,7 +216,7 @@ async function getOpenSkyToken(t: Tracer): Promise<string> {
   });
 
   const r = await t.run('opensky.token', () =>
-    timedFetchWithRetry(
+    timedOpenSkyFetchWithRetry(
       'opensky.token',
       OS_TOKEN_URL,
       {
@@ -176,7 +227,7 @@ async function getOpenSkyToken(t: Tracer): Promise<string> {
         },
         body,
       },
-      22_000,
+      45_000,
       2,
     ),
   );
@@ -194,11 +245,11 @@ async function fetchOpenSky(t: Tracer, token: string, cfg: WatchConfig) {
     `https://opensky-network.org/api/states/all` +
     `?lamin=${box.lamin}&lomin=${box.lomin}&lamax=${box.lamax}&lomax=${box.lomax}`;
   const r = await t.run('opensky.states', () =>
-    timedFetch(
+    timedOpenSkyFetch(
       'opensky.states',
       url,
       { headers: { Authorization: `Bearer ${token}` } },
-      10_000,
+      30_000,
     ),
   );
   const j = (await r.json()) as { states: unknown[][] | null };
