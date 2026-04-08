@@ -3,12 +3,11 @@ import { Redis } from '@upstash/redis';
 
 const redis = Redis.fromEnv();
 
-const LAT = parseFloat(process.env.WATCH_LAT!);
-const LON = parseFloat(process.env.WATCH_LON!);
-const RADIUS_KM = parseFloat(process.env.WATCH_RADIUS_KM ?? '50');
 const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL!;
-const CRON_SECRET = (process.env.CRON_SECRET ?? '').trim();
+const CRON_SECRET = process.env.CRON_SECRET!;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const ALERT_TTL_SECONDS = 6 * 3600;
+const SIGHTINGS_MAX = 200;
 
 const OS_CLIENT_ID = process.env.OPENSKY_CLIENT_ID;
 const OS_CLIENT_SECRET = process.env.OPENSKY_CLIENT_SECRET;
@@ -16,8 +15,33 @@ const OS_TOKEN_URL =
   'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
 
 // ──────────────────────────────────────────────────────────────────
-// Stage tracking — every step appends to this so we know exactly
-// where execution died if anything throws.
+// Config — stored in Redis under "config", with env-var fallback
+// for the very first run before the dashboard has been used.
+// ──────────────────────────────────────────────────────────────────
+export type WatchConfig = { lat: number; lon: number; radiusKm: number };
+
+export async function getConfig(): Promise<WatchConfig> {
+  const stored = await redis.get<WatchConfig>('config');
+  if (
+    stored &&
+    typeof stored.lat === 'number' &&
+    typeof stored.lon === 'number'
+  ) {
+    return {
+      lat: stored.lat,
+      lon: stored.lon,
+      radiusKm: stored.radiusKm ?? 50,
+    };
+  }
+  return {
+    lat: parseFloat(process.env.WATCH_LAT ?? '50.9375'),
+    lon: parseFloat(process.env.WATCH_LON ?? '6.9603'),
+    radiusKm: parseFloat(process.env.WATCH_RADIUS_KM ?? '50'),
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Tracer + timedFetch (same pattern as before)
 // ──────────────────────────────────────────────────────────────────
 class Tracer {
   steps: { stage: string; ms: number; ok: boolean; detail?: string }[] = [];
@@ -25,28 +49,21 @@ class Tracer {
 
   async run<T>(stage: string, fn: () => Promise<T>): Promise<T> {
     const t0 = Date.now();
-    console.log(`[spot] → ${stage}`);
     try {
       const result = await fn();
-      const ms = Date.now() - t0;
-      this.steps.push({ stage, ms, ok: true });
-      console.log(`[spot] ✓ ${stage} (${ms}ms)`);
+      this.steps.push({ stage, ms: Date.now() - t0, ok: true });
       return result;
     } catch (e: unknown) {
       const ms = Date.now() - t0;
-      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-      this.steps.push({ stage, ms, ok: false, detail });
-      console.error(`[spot] ✗ ${stage} (${ms}ms): ${detail}`);
-      // Surface fetch's `cause` field — that's where Node hides the real
-      // network error (DNS, connect refused, TLS, timeout, etc).
+      let detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       if (e instanceof Error && 'cause' in e && e.cause) {
         const cause =
           e.cause instanceof Error
             ? `${e.cause.name}: ${e.cause.message}`
             : String(e.cause);
-        this.steps[this.steps.length - 1].detail += ` | cause: ${cause}`;
-        console.error(`[spot]   cause: ${cause}`);
+        detail += ` | cause: ${cause}`;
       }
+      this.steps.push({ stage, ms, ok: false, detail });
       throw e;
     }
   }
@@ -56,7 +73,6 @@ class Tracer {
   }
 }
 
-/** Fetch with an explicit timeout and a labeled error. */
 async function timedFetch(
   label: string,
   url: string,
@@ -104,31 +120,11 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-function headerFirst(
-  v: string | string[] | undefined,
-): string | undefined {
-  if (v == null) return undefined;
-  return Array.isArray(v) ? v[0] : v;
-}
-
-/** Supports `Authorization: Bearer …` and `X-Cron-Secret` (some schedulers mangle auth). */
-function matchesCronSecret(req: VercelRequest, secret: string): boolean {
-  const s = secret.trim();
-  if (!s) return false;
-  const x = headerFirst(req.headers['x-cron-secret']);
-  if (x !== undefined && x.trim() === s) return true;
-  const auth = headerFirst(req.headers.authorization);
-  if (auth === undefined) return false;
-  const m = auth.match(/^\s*Bearer\s+(.+?)\s*$/i);
-  return m !== null && m[1].trim() === s;
-}
-
 async function getOpenSkyToken(t: Tracer): Promise<string> {
   if (!OS_CLIENT_ID || !OS_CLIENT_SECRET) {
     throw new Error('OPENSKY_CLIENT_ID or OPENSKY_CLIENT_SECRET not set');
   }
-
-  const cached = await t.run('redis.get(opensky:token)', () =>
+  const cached = await t.run('redis.get(token)', () =>
     redis.get<string>('opensky:token'),
   );
   if (cached) return cached;
@@ -151,21 +147,19 @@ async function getOpenSkyToken(t: Tracer): Promise<string> {
       10_000,
     ),
   );
-
   const j = (await r.json()) as { access_token: string; expires_in: number };
   const ttl = Math.max(60, (j.expires_in ?? 1800) - 60);
-  await t.run('redis.set(opensky:token)', () =>
+  await t.run('redis.set(token)', () =>
     redis.set('opensky:token', j.access_token, { ex: ttl }),
   );
   return j.access_token;
 }
 
-async function fetchOpenSky(t: Tracer, token: string) {
-  const box = bbox(LAT, LON, RADIUS_KM);
+async function fetchOpenSky(t: Tracer, token: string, cfg: WatchConfig) {
+  const box = bbox(cfg.lat, cfg.lon, cfg.radiusKm);
   const url =
     `https://opensky-network.org/api/states/all` +
     `?lamin=${box.lamin}&lomin=${box.lomin}&lamax=${box.lamax}&lomax=${box.lomax}`;
-
   const r = await t.run('opensky.states', () =>
     timedFetch(
       'opensky.states',
@@ -182,7 +176,6 @@ async function lookupType(icao24: string): Promise<string | null> {
   const key = `type:${icao24}`;
   const cached = await redis.get<string>(key);
   if (cached !== null) return cached === '__none__' ? null : cached;
-
   try {
     const r = await timedFetch(
       `hexdb(${icao24})`,
@@ -194,11 +187,7 @@ async function lookupType(icao24: string): Promise<string | null> {
     const type = j.ICAOTypeCode || null;
     await redis.set(key, type ?? '__none__', { ex: 30 * 86400 });
     return type;
-  } catch (e) {
-    // Don't poison the cache on transient failures
-    console.warn(
-      `[spot] hexdb lookup failed for ${icao24}: ${(e as Error).message}`,
-    );
+  } catch {
     return null;
   }
 }
@@ -212,9 +201,9 @@ async function postToSlack(
   velKts: string | number,
   heading: number | null,
 ) {
-  await t.run(`slack.post(${callsign})`, () =>
+  await t.run(`slack(${callsign})`, () =>
     timedFetch(
-      'slack.post',
+      'slack',
       SLACK_WEBHOOK,
       {
         method: 'POST',
@@ -243,19 +232,19 @@ async function postToSlack(
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const t = new Tracer();
 
-  // Auth
   const isVercelCron = (req.headers['user-agent'] ?? '').includes(
     'vercel-cron',
   );
-  if (!isVercelCron && !matchesCronSecret(req, CRON_SECRET)) {
+  const auth = req.headers.authorization;
+  const hasCronSecret = auth === `Bearer ${CRON_SECRET}`;
+  const hasAdminPassword =
+    ADMIN_PASSWORD && auth === `Bearer ${ADMIN_PASSWORD}`;
+  if (!isVercelCron && !hasCronSecret && !hasAdminPassword) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  // Sanity-check env vars before doing any work
   const missing: string[] = [];
   for (const [k, v] of Object.entries({
-    WATCH_LAT: process.env.WATCH_LAT,
-    WATCH_LON: process.env.WATCH_LON,
     SLACK_WEBHOOK_URL: process.env.SLACK_WEBHOOK_URL,
     OPENSKY_CLIENT_ID: process.env.OPENSKY_CLIENT_ID,
     OPENSKY_CLIENT_SECRET: process.env.OPENSKY_CLIENT_SECRET,
@@ -271,20 +260,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       error: `Missing env vars: ${missing.join(', ')}`,
     });
   }
-  if (Number.isNaN(LAT) || Number.isNaN(LON)) {
-    return res.status(500).json({
-      stage: 'env_check',
-      error: `WATCH_LAT/WATCH_LON not numeric: lat=${process.env.WATCH_LAT} lon=${process.env.WATCH_LON}`,
-    });
-  }
 
   try {
+    const cfg = await t.run('redis.get(config)', () => getConfig());
     const token = await getOpenSkyToken(t);
-    const states = await fetchOpenSky(t, token);
+    const states = await fetchOpenSky(t, token, cfg);
 
     const alerted: string[] = [];
 
-    await t.run(`process(${states.length} states)`, async () => {
+    await t.run(`process(${states.length})`, async () => {
       for (const s of states) {
         const icao24 = s[0] as string;
         const lon = s[5] as number | null;
@@ -305,18 +289,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const altM = s[7] as number | null;
         const velMs = s[9] as number | null;
         const heading = s[10] as number | null;
-        const dist = haversine(LAT, LON, lat, lon);
+        const dist = haversine(cfg.lat, cfg.lon, lat, lon);
+        const altFt = altM ? Math.round(altM * 3.281) : null;
+        const velKts = velMs ? Math.round(velMs * 1.944) : null;
 
-        const altFt = altM ? Math.round(altM * 3.281).toLocaleString() : '?';
-        const velKts = velMs ? Math.round(velMs * 1.944) : '?';
+        await postToSlack(
+          t,
+          callsign,
+          icao24,
+          dist,
+          altFt?.toLocaleString() ?? '?',
+          velKts ?? '?',
+          heading,
+        );
 
-        await postToSlack(t, callsign, icao24, dist, altFt, velKts, heading);
+        // Log sighting to Redis history (capped list)
+        const sighting = {
+          ts: Date.now(),
+          icao24,
+          callsign,
+          type,
+          distKm: Number(dist.toFixed(1)),
+          altFt,
+          velKts,
+          heading,
+          lat,
+          lon,
+        };
+        await redis.lpush('sightings', JSON.stringify(sighting));
+        await redis.ltrim('sightings', 0, SIGHTINGS_MAX - 1);
+
         alerted.push(callsign);
       }
     });
 
     return res.status(200).json({
       ok: true,
+      config: cfg,
       checked: states.length,
       alerted,
       totalMs: t.totalMs(),

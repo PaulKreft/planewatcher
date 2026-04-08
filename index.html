@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>planewatcher</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --panel: #14181d;
+        --panel-2: #1a1f26;
+        --line: #232a33;
+        --text: #e6edf3;
+        --muted: #8b95a3;
+        --accent: #6cf;
+        --good: #4ade80;
+        --bad: #f87171;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui,
+          sans-serif;
+        font-size: 15px;
+        line-height: 1.5;
+      }
+      .wrap {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 32px 20px 80px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 28px;
+      }
+      h1 {
+        font-size: 22px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: -0.01em;
+      }
+      h1 .em {
+        color: var(--accent);
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 20px;
+        margin-bottom: 16px;
+      }
+      .panel h2 {
+        font-size: 12px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin: 0 0 12px;
+      }
+      #map {
+        height: 320px;
+        border-radius: 10px;
+        overflow: hidden;
+        background: var(--panel-2);
+      }
+      /* Leaflet dark-mode tile tint */
+      .leaflet-tile-pane {
+        filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.9);
+      }
+      .leaflet-control-attribution {
+        filter: invert(1) hue-rotate(180deg);
+        font-size: 10px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 10px;
+        margin-top: 14px;
+      }
+      .field {
+        background: var(--panel-2);
+        border-radius: 10px;
+        padding: 10px 12px;
+      }
+      .field .label {
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .field input {
+        background: transparent;
+        border: 0;
+        color: var(--text);
+        font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+        font-size: 15px;
+        font-weight: 600;
+        width: 100%;
+        padding: 2px 0 0;
+        outline: none;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 14px;
+      }
+      button {
+        background: var(--accent);
+        color: #001;
+        border: 0;
+        padding: 9px 16px;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 13px;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      button.secondary {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--line);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .toast {
+        font-size: 12px;
+        padding: 8px 12px;
+        border-radius: 6px;
+        margin-top: 10px;
+        display: none;
+      }
+      .toast.ok {
+        background: rgba(74, 222, 128, 0.12);
+        color: var(--good);
+        display: block;
+      }
+      .toast.err {
+        background: rgba(248, 113, 113, 0.12);
+        color: var(--bad);
+        display: block;
+      }
+      .sighting {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 4px 12px;
+        padding: 12px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .sighting:last-child {
+        border-bottom: 0;
+      }
+      .sighting .callsign {
+        font-weight: 600;
+        font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      }
+      .sighting .time {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .sighting .meta {
+        grid-column: 1 / -1;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .empty {
+        color: var(--muted);
+        font-size: 13px;
+        text-align: center;
+        padding: 24px 0;
+      }
+      .login {
+        max-width: 320px;
+        margin: 120px auto;
+        padding: 24px;
+      }
+      .login input {
+        width: 100%;
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        color: var(--text);
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-family: inherit;
+        font-size: 14px;
+        margin-bottom: 10px;
+        outline: none;
+      }
+      .login input:focus {
+        border-color: var(--accent);
+      }
+      .login button {
+        width: 100%;
+      }
+      .hint {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 8px;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Login screen -->
+    <div id="loginScreen" class="wrap" style="display: none">
+      <header>
+        <h1>plane<span class="em">watcher</span></h1>
+      </header>
+      <div class="panel login">
+        <input
+          type="password"
+          id="passwordInput"
+          placeholder="admin password"
+        />
+        <button id="loginBtn">Unlock</button>
+        <div class="hint" id="loginHint"></div>
+      </div>
+    </div>
+
+    <!-- Main app -->
+    <div id="app" class="wrap" style="display: none">
+      <header>
+        <h1>plane<span class="em">watcher</span></h1>
+        <button
+          class="secondary"
+          id="logoutBtn"
+          style="padding: 6px 12px; font-size: 12px"
+        >
+          Lock
+        </button>
+      </header>
+
+      <div class="panel">
+        <h2>Watch location</h2>
+        <div id="map"></div>
+        <div class="row">
+          <div class="field">
+            <div class="label">Latitude</div>
+            <input type="number" id="lat" step="0.0001" />
+          </div>
+          <div class="field">
+            <div class="label">Longitude</div>
+            <input type="number" id="lon" step="0.0001" />
+          </div>
+          <div class="field">
+            <div class="label">Radius (km)</div>
+            <input type="number" id="radius" step="1" min="5" max="300" />
+          </div>
+        </div>
+        <div class="controls">
+          <button id="saveBtn">Save config</button>
+          <button class="secondary" id="testBtn">Run spot now</button>
+        </div>
+        <div class="toast" id="configToast"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Recent sightings</h2>
+        <div id="sightings">
+          <div class="empty">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      const $ = id => document.getElementById(id);
+      const STORAGE_KEY = 'planewatcher_password';
+
+      let map, marker, circle;
+      let state = { lat: 50.9375, lon: 6.9603, radiusKm: 50 };
+
+      function getPassword() {
+        return localStorage.getItem(STORAGE_KEY);
+      }
+      function setPassword(p) {
+        localStorage.setItem(STORAGE_KEY, p);
+      }
+      function clearPassword() {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+
+      async function api(path, opts = {}) {
+        const headers = {
+          'Content-Type': 'application/json',
+          ...(opts.headers || {}),
+        };
+        headers['Authorization'] = `Bearer ${getPassword()}`;
+        const r = await fetch(path, { ...opts, headers });
+        if (r.status === 401) {
+          clearPassword();
+          showLogin('Wrong password. Try again.');
+          throw new Error('unauthorized');
+        }
+        return r;
+      }
+
+      function showLogin(hint) {
+        $('loginScreen').style.display = '';
+        $('app').style.display = 'none';
+        $('loginHint').textContent = hint || '';
+        $('passwordInput').focus();
+      }
+
+      function showApp() {
+        $('loginScreen').style.display = 'none';
+        $('app').style.display = '';
+        initMap();
+        loadConfig();
+        loadSightings();
+      }
+
+      $('loginBtn').onclick = async () => {
+        const p = $('passwordInput').value;
+        if (!p) return;
+        setPassword(p);
+        // Verify by hitting /api/config
+        try {
+          const r = await fetch('/api/config', {
+            headers: { Authorization: `Bearer ${p}` },
+          });
+          if (r.status === 401) {
+            clearPassword();
+            $('loginHint').textContent = 'Wrong password.';
+            return;
+          }
+          showApp();
+        } catch (e) {
+          $('loginHint').textContent = 'Network error. Try again.';
+        }
+      };
+      $('passwordInput').addEventListener('keypress', e => {
+        if (e.key === 'Enter') $('loginBtn').click();
+      });
+
+      $('logoutBtn').onclick = () => {
+        clearPassword();
+        showLogin();
+      };
+
+      function initMap() {
+        if (map) return;
+        map = L.map('map', { zoomControl: true }).setView(
+          [state.lat, state.lon],
+          10,
+        );
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '© OpenStreetMap',
+          maxZoom: 18,
+        }).addTo(map);
+
+        marker = L.marker([state.lat, state.lon], { draggable: true }).addTo(
+          map,
+        );
+        circle = L.circle([state.lat, state.lon], {
+          radius: state.radiusKm * 1000,
+          color: '#6cf',
+          fillColor: '#6cf',
+          fillOpacity: 0.08,
+          weight: 1,
+        }).addTo(map);
+
+        marker.on('drag', e => {
+          const { lat, lng } = e.target.getLatLng();
+          setCoords(lat, lng);
+        });
+        map.on('click', e => {
+          const { lat, lng } = e.latlng;
+          marker.setLatLng([lat, lng]);
+          setCoords(lat, lng);
+        });
+      }
+
+      function setCoords(lat, lon) {
+        state.lat = lat;
+        state.lon = lon;
+        $('lat').value = lat.toFixed(4);
+        $('lon').value = lon.toFixed(4);
+        circle.setLatLng([lat, lon]);
+      }
+
+      function setRadius(km) {
+        state.radiusKm = km;
+        $('radius').value = km;
+        circle.setRadius(km * 1000);
+      }
+
+      $('lat').addEventListener('change', e => {
+        const v = parseFloat(e.target.value);
+        if (Number.isFinite(v)) {
+          marker.setLatLng([v, state.lon]);
+          setCoords(v, state.lon);
+        }
+      });
+      $('lon').addEventListener('change', e => {
+        const v = parseFloat(e.target.value);
+        if (Number.isFinite(v)) {
+          marker.setLatLng([state.lat, v]);
+          setCoords(state.lat, v);
+        }
+      });
+      $('radius').addEventListener('change', e => {
+        const v = parseFloat(e.target.value);
+        if (Number.isFinite(v)) setRadius(v);
+      });
+
+      async function loadConfig() {
+        try {
+          const r = await api('/api/config');
+          const cfg = await r.json();
+          state = cfg;
+          marker.setLatLng([cfg.lat, cfg.lon]);
+          map.setView([cfg.lat, cfg.lon], 10);
+          setCoords(cfg.lat, cfg.lon);
+          setRadius(cfg.radiusKm);
+        } catch (e) {
+          /* handled in api() */
+        }
+      }
+
+      $('saveBtn').onclick = async () => {
+        const toast = $('configToast');
+        toast.className = 'toast';
+        try {
+          const r = await api('/api/config', {
+            method: 'POST',
+            body: JSON.stringify(state),
+          });
+          const j = await r.json();
+          if (r.ok) {
+            toast.className = 'toast ok';
+            toast.textContent =
+              'Saved. Next spot run will use the new coordinates.';
+          } else {
+            toast.className = 'toast err';
+            toast.textContent = j.error || 'Save failed';
+          }
+        } catch (e) {
+          toast.className = 'toast err';
+          toast.textContent = e.message;
+        }
+      };
+
+      $('testBtn').onclick = async () => {
+        const toast = $('configToast');
+        toast.className = 'toast';
+        toast.textContent = 'Running…';
+        toast.style.display = 'block';
+        try {
+          const r = await fetch('/api/spot', {
+            headers: { Authorization: `Bearer ${getPassword()}` },
+          });
+          const j = await r.json();
+          if (j.ok) {
+            toast.className = 'toast ok';
+            toast.textContent =
+              `Checked ${j.checked} aircraft in ${j.totalMs}ms. ` +
+              (j.alerted.length
+                ? `Alerted: ${j.alerted.join(', ')}`
+                : 'No A380s detected.');
+            loadSightings();
+          } else {
+            toast.className = 'toast err';
+            toast.textContent = `${j.stage || 'error'}: ${j.error || 'unknown'}`;
+          }
+        } catch (e) {
+          toast.className = 'toast err';
+          toast.textContent = e.message;
+        }
+      };
+
+      async function loadSightings() {
+        try {
+          const r = await api('/api/sightings');
+          const { sightings } = await r.json();
+          const wrap = $('sightings');
+          if (!sightings || sightings.length === 0) {
+            wrap.innerHTML = '<div class="empty">No sightings yet.</div>';
+            return;
+          }
+          wrap.innerHTML = sightings
+            .map(
+              s => `
+      <div class="sighting">
+        <div class="callsign">${s.callsign}</div>
+        <div class="time">${new Date(s.ts).toLocaleString()}</div>
+        <div class="meta">
+          ${s.distKm} km away
+          ${s.altFt ? ' · ' + s.altFt.toLocaleString() + ' ft' : ''}
+          ${s.velKts ? ' · ' + s.velKts + ' kts' : ''}
+          · ${s.type}
+        </div>
+      </div>
+    `,
+            )
+            .join('');
+        } catch (e) {
+          /* handled in api() */
+        }
+      }
+
+      // Boot
+      if (getPassword()) showApp();
+      else showLogin();
+    </script>
+  </body>
+</html>
