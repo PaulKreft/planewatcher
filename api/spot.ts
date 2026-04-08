@@ -120,6 +120,23 @@ async function timedFetch(
   }
 }
 
+function hintForOpenSkyFailure(stage: string, detail: string): string | undefined {
+  if (!stage.startsWith('opensky.')) return undefined;
+  const d = detail.toLowerCase();
+  if (
+    d.includes('etimedout') ||
+    d.includes('connect timeout') ||
+    d.includes('econnrefused') ||
+    d.includes('network unreachable')
+  ) {
+    return (
+      'OpenSky’s auth and data API use the same IP; if Vercel cannot open TCP (ETIMEDOUT), both token and /states fail. ' +
+      'Set OPENSKY_HTTPS_PROXY to an HTTP CONNECT proxy that can reach opensky-network.org, try a different regions value in vercel.json (e.g. iad1), or run the poller on a host with working connectivity.'
+    );
+  }
+  return undefined;
+}
+
 function isTimeoutError(e: unknown): boolean {
   if (!(e instanceof Error)) return false;
   if (e.name === 'AbortError' || /timed out after \d+ms/.test(e.message))
@@ -428,10 +445,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   } catch (e: unknown) {
     const failed = t.steps.find(s => !s.ok);
+    const errText =
+      failed?.detail ?? (e instanceof Error ? e.message : String(e));
+    const hint =
+      failed?.detail && failed?.stage
+        ? hintForOpenSkyFailure(failed.stage, failed.detail)
+        : undefined;
     return res.status(500).json({
       ok: false,
       stage: failed?.stage ?? 'unknown',
-      error: failed?.detail ?? (e instanceof Error ? e.message : String(e)),
+      error: errText,
+      ...(hint ? { hint } : {}),
       totalMs: t.totalMs(),
       steps: t.steps,
     });
