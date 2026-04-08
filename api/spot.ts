@@ -7,7 +7,7 @@ const LAT = parseFloat(process.env.WATCH_LAT!);
 const LON = parseFloat(process.env.WATCH_LON!);
 const RADIUS_KM = parseFloat(process.env.WATCH_RADIUS_KM ?? '50');
 const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL!;
-const CRON_SECRET = process.env.CRON_SECRET!;
+const CRON_SECRET = (process.env.CRON_SECRET ?? '').trim();
 const ALERT_TTL_SECONDS = 6 * 3600;
 
 const OS_CLIENT_ID = process.env.OPENSKY_CLIENT_ID;
@@ -102,6 +102,25 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function headerFirst(
+  v: string | string[] | undefined,
+): string | undefined {
+  if (v == null) return undefined;
+  return Array.isArray(v) ? v[0] : v;
+}
+
+/** Supports `Authorization: Bearer …` and `X-Cron-Secret` (some schedulers mangle auth). */
+function matchesCronSecret(req: VercelRequest, secret: string): boolean {
+  const s = secret.trim();
+  if (!s) return false;
+  const x = headerFirst(req.headers['x-cron-secret']);
+  if (x !== undefined && x.trim() === s) return true;
+  const auth = headerFirst(req.headers.authorization);
+  if (auth === undefined) return false;
+  const m = auth.match(/^\s*Bearer\s+(.+?)\s*$/i);
+  return m !== null && m[1].trim() === s;
 }
 
 async function getOpenSkyToken(t: Tracer): Promise<string> {
@@ -228,8 +247,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const isVercelCron = (req.headers['user-agent'] ?? '').includes(
     'vercel-cron',
   );
-  const hasSecret = req.headers.authorization === `Bearer ${CRON_SECRET}`;
-  if (!isVercelCron && !hasSecret) {
+  if (!isVercelCron && !matchesCronSecret(req, CRON_SECRET)) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 

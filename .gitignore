@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Env and secrets (keep .env.example tracked)
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Vercel
+.vercel
+
+# Logs / debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# TypeScript / build output (if added later)
+dist/
+build/
+*.tsbuildinfo
