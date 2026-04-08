@@ -98,6 +98,35 @@ async function timedFetch(
   }
 }
 
+function isTimeoutError(e: unknown): boolean {
+  return (
+    e instanceof Error &&
+    (e.name === 'AbortError' ||
+      /timed out after \d+ms/.test(e.message))
+  );
+}
+
+/** Retries only on transport timeouts (slow / stalled upstream). */
+async function timedFetchWithRetry(
+  label: string,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  attempts: number,
+): Promise<Response> {
+  let last: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await timedFetch(label, url, init, timeoutMs);
+    } catch (e) {
+      last = e;
+      if (!isTimeoutError(e) || i === attempts - 1) throw e;
+      await new Promise(r => setTimeout(r, 400 * (i + 1)));
+    }
+  }
+  throw last;
+}
+
 function bbox(lat: number, lon: number, km: number) {
   const dLat = km / 111;
   const dLon = km / (111 * Math.cos((lat * Math.PI) / 180));
@@ -136,15 +165,19 @@ async function getOpenSkyToken(t: Tracer): Promise<string> {
   });
 
   const r = await t.run('opensky.token', () =>
-    timedFetch(
+    timedFetchWithRetry(
       'opensky.token',
       OS_TOKEN_URL,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        },
         body,
       },
-      10_000,
+      22_000,
+      2,
     ),
   );
   const j = (await r.json()) as { access_token: string; expires_in: number };
