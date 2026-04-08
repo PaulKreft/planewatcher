@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import dns from 'node:dns';
-import { Agent, fetch as undiciFetch } from 'undici';
+import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from 'undici';
 import { Redis } from '@upstash/redis';
 
 /** Prefer IPv4 — Vercel ↔ OpenSky often stalls on broken IPv6 paths. */
@@ -8,12 +8,22 @@ dns.setDefaultResultOrder('ipv4first');
 
 const redis = Redis.fromEnv();
 
-/** Undici default connect timeout is 10s; OpenSky auth often needs more from serverless. */
-const openskyDispatcher = new Agent({
-  connect: {
-    timeout: 35_000,
-  },
-});
+/**
+ * OpenSky often drops or blackholes datacenter egress (ETIMEDOUT to auth API).
+ * Optional HTTP(S) CONNECT proxy that can reach OpenSky (small VPS, home tunnel, etc.):
+ * `http://user:pass@host:port` or `http://host:port`
+ */
+const OPENSKY_PROXY = process.env.OPENSKY_HTTPS_PROXY?.trim();
+
+const openskyConnectOpts = { timeout: 35_000 } as const;
+
+const openskyDispatcher = OPENSKY_PROXY
+  ? new EnvHttpProxyAgent({
+      httpsProxy: OPENSKY_PROXY,
+      httpProxy: OPENSKY_PROXY,
+      connect: openskyConnectOpts,
+    })
+  : new Agent({ connect: openskyConnectOpts });
 
 const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL!;
 const CRON_SECRET = process.env.CRON_SECRET!;
@@ -118,6 +128,7 @@ function isTimeoutError(e: unknown): boolean {
   for (let d = 0; d < 5 && cur instanceof Error; d++) {
     if (cur.name === 'ConnectTimeoutError') return true;
     if (/Connect Timeout Error/i.test(cur.message)) return true;
+    if (/ETIMEDOUT/i.test(cur.message)) return true;
     cur = 'cause' in cur ? cur.cause : null;
   }
   return false;
